@@ -1,0 +1,57 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+//@version=6
+indicator("Key Reversals with 20-Bar High/Low Lines", overlay = true, max_lines_count = 500)
+
+// --- Inputs ---
+lookback = input.int(20, "Lookback Period", minval = 1, tooltip = "Number of bars to check for a new high or low.")
+showLines = input.bool(true, "Show Horizontal Lines", tooltip = "Draw lines from the previous high/low to the reversal bar.")
+
+// --- Colors ---
+color BULL_COLOR = #5b9cf6 // Blue
+color BEAR_COLOR = #f23645 // Red
+
+// --- Core Logic ---
+isBullCandle = close > open
+isBearCandle = close < open
+
+// Reference highs and lows for the lookback period (excluding current bar)
+prevHighest = ta.highest(high[1], lookback)
+prevLowest  = ta.lowest(low[1], lookback)
+
+// Find the bar index of those highs/lows
+// ta.highestbars returns a negative offset, so we add it to the current bar_index
+prevHighestIdx = bar_index + ta.highestbars(high[1], lookback)
+prevLowestIdx  = bar_index + ta.lowestbars(low[1], lookback)
+
+// --- Key Reversal Detection ---
+// Reversals must make a NEW high/low relative to the lookback period
+
+// Bullish Reversal: New low (< prevLowest), close > prev close, bullish candle
+isSingleBullish = low < prevLowest and close > close[1] and isBullCandle
+isDoubleBullish = low < prevLowest and close > close[1] and close > close[2] and isBullCandle
+
+// Bearish Reversal: New high (> prevHighest), close < prev close, bearish candle
+isSingleBearish = high > prevHighest and close < close[1] and isBearCandle
+isDoubleBearish = high > prevHighest and close < close[1] and close < close[2] and isBearCandle
+
+// Prioritize double signals
+isOnlySingleBullish = isSingleBullish and not isDoubleBullish
+isOnlySingleBearish = isSingleBearish and not isDoubleBearish
+
+// --- Visuals: Markers ---
+
+// Single Reversals: One arrow
+plotshape(isOnlySingleBullish, "Single Bullish", shape.arrowup,   location.belowbar, BULL_COLOR, size = size.small)
+plotshape(isOnlySingleBearish, "Single Bearish", shape.arrowdown, location.abovebar, BEAR_COLOR, size = size.small)
+
+// Double Reversals: Circles
+plotshape(isDoubleBullish, "Double Bullish", shape.circle, location.belowbar, BULL_COLOR, size = size.small)
+plotshape(isDoubleBearish, "Double Bearish", shape.circle, location.abovebar, BEAR_COLOR, size = size.small)
+
+// --- Visuals: Horizontal Lines ---
+if showLines
+    if isSingleBullish or isDoubleBullish
+        line.new(prevLowestIdx, prevLowest, bar_index, prevLowest, color = BULL_COLOR, style = line.style_dashed)
+        
+    if isSingleBearish or isDoubleBearish
+        line.new(prevHighestIdx, prevHighest, bar_index, prevHighest, color = BEAR_COLOR, style = line.style_dashed)
