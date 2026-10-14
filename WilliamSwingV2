@@ -1,0 +1,572 @@
+//@version=6
+// =============================================================================
+// Williams Swings V2 - port of WilliamsSwingsV2.mq5 (ST / IT / LT swings + BOS)
+// =============================================================================
+// Deliberate differences from the MQL5 version (see notes after the code):
+//  * No sliding 2000-bar window: structure is built incrementally over full history.
+//  * Swings are drawn as polylines on the last bar (Pine plots cannot be revised).
+//  * No arrow offset input; alerts use alert() (delivery channel is chosen in TV).
+// All stateful logic runs ONLY on confirmed bars (barstate.isconfirmed).
+// =============================================================================
+indicator("Williams Swings V2 (ST/IT/LT + BOS)", shorttitle="WSW", overlay=true,
+     max_lines_count=100, max_polylines_count=20)
+
+// =============================================================================
+// INPUTS
+// =============================================================================
+G_STR = "Structure & signals"
+G_DSP = "Display"
+G_ALR = "Alerts"
+
+inpStrict    = input.bool(false, "Strict inside bar", group=G_STR,
+     tooltip="Off: inside = high<=refHigh and low>=refLow. On: strict < and >.")
+inpReqLower  = input.bool(true, "Require lower IT high / higher IT low", group=G_STR,
+     tooltip="Sell setups only if the new IT high is lower than the previous IT high (mirror for buys). Off: any IT point in the trend direction qualifies.")
+inpFlipOnly  = input.bool(false, "Signal only on direction flip", group=G_STR,
+     tooltip="Arrow and signal output only when the notional trade direction changes.")
+inpReplay    = input.int(1000, "Replay bars", minval=1, maxval=20000, group=G_STR,
+     tooltip="Signals/flags are produced only for the last N bars. The first of these bars is a warm-up bar (state is seeded, nothing is emitted).")
+inpWarm      = input.int(2000, "Warm-up lookback (bars)", minval=50, maxval=20000, group=G_STR,
+     tooltip="At the warm-up bar only swing points up to this many bars older than it are fed to the trend machines. Mimics InpMaxBars of the MQL5 version.")
+
+inpShowZZ_ST = input.bool(true,  "Zigzag ST", group=G_DSP, inline="zz1")
+inpShowZZ_IT = input.bool(true,  "Zigzag IT", group=G_DSP, inline="zz1")
+inpShowZZ_LT = input.bool(true,  "Zigzag LT", group=G_DSP, inline="zz1")
+inpShowLv_ST = input.bool(false, "Levels ST", group=G_DSP, inline="lv1",
+     tooltip="Key (dashed) and critical (solid) lines for that level.")
+inpShowLv_IT = input.bool(true,  "Levels IT", group=G_DSP, inline="lv1")
+inpShowLv_LT = input.bool(true,  "Levels LT", group=G_DSP, inline="lv1")
+inpColST = input.color(color.new(#1E90FF, 0), "ST colour", group=G_DSP, inline="c1")
+inpColIT = input.color(color.new(#FFA500, 0), "IT colour", group=G_DSP, inline="c1")
+inpColLT = input.color(color.new(#FF0000, 0), "LT colour", group=G_DSP, inline="c1")
+inpWidST = input.int(1, "ST width", minval=1, maxval=5, group=G_DSP, inline="w1")
+inpWidIT = input.int(2, "IT width", minval=1, maxval=5, group=G_DSP, inline="w1")
+inpWidLT = input.int(3, "LT width", minval=1, maxval=5, group=G_DSP, inline="w1")
+inpDrawBack = input.int(2000, "Draw back (bars)", minval=100, maxval=5000, group=G_DSP,
+     tooltip="Only swings this many bars back from the last bar are drawn (drawing objects have a bar_index reach limit).")
+inpDebug = input.bool(false, "Debug log", group=G_DSP, tooltip="Writes a one-line summary to the Pine Logs panel.")
+
+inpAlertBos     = input.bool(true,  "BOS signal", group=G_ALR)
+inpAlertCritST  = input.bool(false, "Critical break ST", group=G_ALR, inline="ac")
+inpAlertCritIT  = input.bool(true,  "IT", group=G_ALR, inline="ac")
+inpAlertCritLT  = input.bool(true,  "LT", group=G_ALR, inline="ac")
+inpAlertKeyST   = input.bool(false, "Key warning ST", group=G_ALR, inline="ak")
+inpAlertKeyIT   = input.bool(false, "IT", group=G_ALR, inline="ak")
+inpAlertKeyLT   = input.bool(false, "LT", group=G_ALR, inline="ak")
+
+// Per-level lookups (index 0 = ST, 1 = IT, 2 = LT)
+LVN       = array.from("ST", "IT", "LT")
+showZZ    = array.from(inpShowZZ_ST, inpShowZZ_IT, inpShowZZ_LT)
+showLv    = array.from(inpShowLv_ST, inpShowLv_IT, inpShowLv_LT)
+lvColor   = array.from(inpColST, inpColIT, inpColLT)
+lvWidth   = array.from(inpWidST, inpWidIT, inpWidLT)
+alertCrit = array.from(inpAlertCritST, inpAlertCritIT, inpAlertCritLT)
+alertKey  = array.from(inpAlertKeyST, inpAlertKeyIT, inpAlertKeyLT)
+
+// =============================================================================
+// TYPES
+// =============================================================================
+// A swing point. hi/lo are the apex candle's high/low (needed for the trigger).
+// typ: +1 = swing high, -1 = swing low. price = hi for highs, lo for lows.
+type SwingPt
+    int bar
+    float price
+    int typ
+    float hi
+    float lo
+
+// Trend machine: trend flips after 2 consecutive "counter" points (lower highs in an uptrend...)
+type TrendMachine
+    int trend = 0
+    int counter = 0
+    float lastH = na
+    float lastL = na
+    bool hasH = false
+    bool hasL = false
+
+// A swing list split into a COMMITTED part (final) and a TENTATIVE tail.
+// Full list = c[0 .. cut-1] followed by tail[]. Only the last element of a list can
+// ever be replaced (AddAlt), so the tail is at most 2 elements and cheap to rebuild.
+type LevelList
+    array<SwingPt> c
+    int cut = 0
+    array<SwingPt> tail
+    int cj = 2          // next source index j to be committed (NextLevel loop starts at 2)
+
+// Misc scalar state. Functions cannot reassign global variables, but they CAN
+// change fields of an object, so all mutable scalars live here.
+type EngineState
+    float refH = na     // reference (last non-inside) bar high
+    float refL = na
+    int pendDir = 0     // 0 none, +1 pending buy, -1 pending sell
+    float pendTrig = na
+    float pendCancel = na
+    int tradeState = 0  // notional: +1 long, -1 short
+    int sigNow = 0      // signal emitted on this bar
+    bool sigFlip = false
+
+// =============================================================================
+// PERSISTENT STATE
+// =============================================================================
+var array<int> eBar   = array.new<int>()       // elements = non-inside bars
+var array<float> eH   = array.new<float>()
+var array<float> eL   = array.new<float>()
+
+var LevelList stL = LevelList.new(c = array.new<SwingPt>(), tail = array.new<SwingPt>())
+var LevelList itL = LevelList.new(c = array.new<SwingPt>(), tail = array.new<SwingPt>())
+var LevelList ltL = LevelList.new(c = array.new<SwingPt>(), tail = array.new<SwingPt>())
+
+var array<TrendMachine> tms = array.from(TrendMachine.new(), TrendMachine.new(), TrendMachine.new())
+var TrendMachine eng = TrendMachine.new()      // IT-only engine that drives BOS signals
+var EngineState es = EngineState.new()
+
+// Engine starts at this bar. Fixed once, on the first bar of the script run.
+var int startBar = math.max(1, last_bar_index - inpReplay)
+
+var array<int> trkBar  = array.new<int>(3, math.max(-1, startBar - inpWarm - 1))  // last processed point bar
+var array<int> trkType = array.new<int>(3, 0)                                     // last processed point type
+var array<int> warnKeyBar   = array.new<int>(3, -1)   // key swing bars already warned about
+var array<int> brokeCritBar = array.new<int>(3, -1)   // critical swing bars already broken
+
+// Levels of the last processed bar (for drawing)
+var array<float> gKeyP  = array.new<float>(3, na)
+var array<int>   gKeyB  = array.new<int>(3, -1)
+var array<float> gCritP = array.new<float>(3, na)
+var array<int>   gCritB = array.new<int>(3, -1)
+
+var array<SwingPt> tmp = array.new<SwingPt>()   // scratch list for ProcessLevelPoints
+var int lastProc = -1                           // last bar the engine processed
+var array<line> lns = array.new<line>()
+var array<polyline> polys = array.new<polyline>()
+
+// Per-bar outputs (reset every bar; na = empty)
+var array<float> outS     = array.new<float>(3, na)   // 0 signal, 1 trade state, 2 IT engine trend
+var array<float> outTrend = array.new<float>(3, na)
+var array<float> outCrit  = array.new<float>(3, na)
+var array<float> outKey   = array.new<float>(3, na)
+var array<float> outKeyP  = array.new<float>(3, na)
+var array<float> outCritP = array.new<float>(3, na)
+
+outS.fill(na)
+outTrend.fill(na)
+outCrit.fill(na)
+outKey.fill(na)
+outKeyP.fill(na)
+outCritP.fill(na)
+es.sigNow := 0
+es.sigFlip := false
+
+// =============================================================================
+// HELPERS: list access
+// =============================================================================
+f_size(LevelList l) =>
+    l.cut + l.tail.size()
+
+f_at(LevelList l, int i) =>
+    SwingPt r = na
+    if i < l.cut
+        r := l.c.get(i)
+    else
+        r := l.tail.get(i - l.cut)
+    r
+
+// AddAlt on a real array: same-type point replaces the last one only if it is more extreme.
+f_addAlt(array<SwingPt> arr, SwingPt p) =>
+    int n = arr.size()
+    if n == 0
+        arr.push(p)
+    else
+        SwingPt last = arr.get(n - 1)
+        if last.typ == p.typ
+            bool better = (p.typ > 0 and p.price > last.price) or (p.typ < 0 and p.price < last.price)
+            if better
+                arr.set(n - 1, p)
+        else
+            arr.push(p)
+
+// AddAlt on the "virtual" list c[0..cut-1] + tail (never touches c itself).
+f_addAltV(LevelList l, SwingPt p) =>
+    int tn = l.tail.size()
+    SwingPt last = na
+    if tn > 0
+        last := l.tail.get(tn - 1)
+    else if l.cut > 0
+        last := l.c.get(l.cut - 1)
+    if na(last)
+        l.tail.push(p)
+    else if last.typ == p.typ
+        bool better = (p.typ > 0 and p.price > last.price) or (p.typ < 0 and p.price < last.price)
+        if better
+            if tn > 0
+                l.tail.set(tn - 1, p)
+            else
+                l.cut := l.cut - 1
+                l.tail.push(p)
+    else
+        l.tail.push(p)
+
+// NextLevel pivot test at source index j: point beats both same-type neighbours (j-2, j+2).
+f_ok(LevelList src, int j) =>
+    SwingPt m = f_at(src, j)
+    SwingPt a = f_at(src, j - 2)
+    SwingPt b = f_at(src, j + 2)
+    m.typ > 0 ? (m.price > a.price and m.price > b.price) : (m.price < a.price and m.price < b.price)
+
+// NextLevel(src -> dst), incremental.
+// Source elements 0 .. src.c.size()-2 are final, so any j with j+2 <= that is COMMITTED.
+// Remaining j's depend on the mutable last source element(s): evaluated into the tail only.
+f_nextLevel(LevelList dst, LevelList src) =>
+    int fixedN = src.c.size() - 1
+    while dst.cj + 2 <= fixedN - 1
+        int j = dst.cj
+        if f_ok(src, j)
+            f_addAlt(dst.c, f_at(src, j))
+        dst.cj := dst.cj + 1
+    dst.cut := dst.c.size()
+    dst.tail.clear()
+    int n = f_size(src)
+    int j2 = dst.cj
+    while j2 + 2 <= n - 1
+        if f_ok(src, j2)
+            f_addAltV(dst, f_at(src, j2))
+        j2 := j2 + 1
+
+// =============================================================================
+// ELEMENTS + SHORT-TERM SWINGS (incremental)
+// =============================================================================
+f_structure() =>
+    bool addElem = false
+    if bar_index == 0
+        addElem := true
+    else
+        bool inside = inpStrict ? (high < es.refH and low > es.refL) : (high <= es.refH and low >= es.refL)
+        addElem := not inside
+    if addElem
+        eBar.push(bar_index)
+        eH.push(high)
+        eL.push(low)
+        es.refH := high
+        es.refL := low
+        int n = eBar.size()
+        if n >= 3
+            // The newly appended element makes element n-2 evaluable (needs both neighbours).
+            int k = n - 2
+            bool sH = eH.get(k) > eH.get(k - 1) and eH.get(k) > eH.get(k + 1)
+            bool sL = eL.get(k) < eL.get(k - 1) and eL.get(k) < eL.get(k + 1)
+            if sH != sL
+                float px = sH ? eH.get(k) : eL.get(k)
+                int ty = sH ? 1 : -1
+                SwingPt p = SwingPt.new(eBar.get(k), px, ty, eH.get(k), eL.get(k))
+                f_addAlt(stL.c, p)
+                stL.cut := stL.c.size()
+
+// =============================================================================
+// TREND MACHINE
+// =============================================================================
+// Returns [lowerHigh, higherLow], computed BEFORE lastH/lastL are updated.
+f_feed(TrendMachine m, SwingPt p) =>
+    bool lh = false
+    bool hl = false
+    if p.typ > 0
+        lh := m.hasH and p.price < m.lastH
+        if m.trend == 0
+            if lh
+                m.trend := -1
+                m.counter := 0
+        else if m.trend == 1
+            m.counter := lh ? m.counter + 1 : 0
+            if m.counter >= 2
+                m.trend := -1
+                m.counter := 0
+        m.lastH := p.price
+        m.hasH := true
+    else
+        hl := m.hasL and p.price > m.lastL
+        if m.trend == 0
+            if hl
+                m.trend := 1
+                m.counter := 0
+        else if m.trend == -1
+            m.counter := hl ? m.counter + 1 : 0
+            if m.counter >= 2
+                m.trend := 1
+                m.counter := 0
+        m.lastL := p.price
+        m.hasL := true
+    [lh, hl]
+
+// =============================================================================
+// ALERTS / SIGNALS
+// =============================================================================
+f_notify(bool enabled, string msg) =>
+    if enabled and barstate.isrealtime
+        alert(msg, alert.freq_once_per_bar_close)
+
+f_hdr() =>
+    syminfo.ticker + " " + timeframe.period + ": "
+
+f_ts() =>
+    str.format_time(time, "yyyy-MM-dd HH:mm")
+
+// EmitSignal: tradeState always updates; the arrow can be suppressed by "flip only".
+f_emit(int dir) =>
+    bool flip = dir != es.tradeState
+    es.tradeState := dir
+    if flip or not inpFlipOnly
+        es.sigNow := dir
+        es.sigFlip := flip
+        string side = dir > 0 ? "BUY" : "SELL"
+        string kind = flip ? "flip" : "repeat"
+        f_notify(inpAlertBos, f_hdr() + side + " signal on closed bar " + f_ts() + " (" + kind + ")")
+
+f_evalPending() =>
+    if es.pendDir == -1
+        if close > es.pendCancel
+            es.pendDir := 0
+        else if close < es.pendTrig
+            f_emit(-1)
+            es.pendDir := 0
+    else if es.pendDir == 1
+        if close < es.pendCancel
+            es.pendDir := 0
+        else if close > es.pendTrig
+            f_emit(1)
+            es.pendDir := 0
+
+// =============================================================================
+// ProcessLevelPoints
+// =============================================================================
+f_process(int lv, LevelList l, bool warm) =>
+    int lastBar = trkBar.get(lv)
+    // Collect points newer than the last processed one (list is ordered by bar), oldest first.
+    tmp.clear()
+    int i = f_size(l) - 1
+    while i >= 0
+        SwingPt q = f_at(l, i)
+        if q.bar <= lastBar
+            break
+        tmp.unshift(q)
+        i := i - 1
+    TrendMachine m = tms.get(lv)
+    for p in tmp
+        bool quiet = p.typ == trkType.get(lv)
+        trkBar.set(lv, p.bar)
+        trkType.set(lv, p.typ)
+        if quiet
+            // Same type as previous processed point = revision only. No Feed, no setup.
+            if p.typ > 0
+                m.lastH := p.price
+                if lv == 1
+                    eng.lastH := p.price
+            else
+                m.lastL := p.price
+                if lv == 1
+                    eng.lastL := p.price
+            continue
+        [lhM, hlM] = f_feed(m, p)
+        if lv == 1
+            [lh2, hl2] = f_feed(eng, p)
+            es.pendDir := 0      // every non-quiet IT point clears any setup
+            if not warm
+                if p.typ > 0 and eng.trend < 0 and (lh2 or not inpReqLower)
+                    es.pendDir := -1
+                    es.pendTrig := p.lo
+                    es.pendCancel := p.price
+                else if p.typ < 0 and eng.trend > 0 and (hl2 or not inpReqLower)
+                    es.pendDir := 1
+                    es.pendTrig := p.hi
+                    es.pendCancel := p.price
+
+// =============================================================================
+// FindLevels + EvalLevel
+// =============================================================================
+// Returns [keyPrice, keyBar, critPrice, critBar]. Uptrend uses swing lows, downtrend swing highs.
+f_findLevels(LevelList l, int tr) =>
+    int want = tr > 0 ? -1 : 1
+    SwingPt a = na
+    SwingPt b = na
+    int i = f_size(l) - 1
+    while i >= 0 and na(b)
+        SwingPt p = f_at(l, i)
+        if p.typ == want
+            if na(a)
+                a := p
+            else
+                b := p
+        i := i - 1
+    float keyP = na
+    int keyB = -1
+    float critP = na
+    int critB = -1
+    if not na(a)
+        if na(b)
+            keyP := a.price
+            keyB := a.bar
+        else
+            bool aNearer = tr > 0 ? a.price >= b.price : a.price <= b.price
+            if aNearer
+                keyP := a.price
+                keyB := a.bar
+                critP := b.price
+                critB := b.bar
+            else
+                keyP := b.price
+                keyB := b.bar
+                critP := a.price
+                critB := a.bar
+    [keyP, keyB, critP, critB]
+
+f_evalLevel(int lv, LevelList l, bool warm) =>
+    TrendMachine m = tms.get(lv)
+    int tr = m.trend
+    float keyP = na
+    int keyB = -1
+    float critP = na
+    int critB = -1
+    if tr != 0
+        [kp, kb, cp, cb] = f_findLevels(l, tr)
+        keyP := kp
+        keyB := kb
+        critP := cp
+        critB := cb
+    gKeyP.set(lv, keyP)
+    gKeyB.set(lv, keyB)
+    gCritP.set(lv, critP)
+    gCritB.set(lv, critB)
+    bool critBroken = false
+    if tr != 0
+        int sgn = tr > 0 ? -1 : 1               // -1 support broken, +1 resistance broken
+        string what = sgn < 0 ? "support" : "resistance"
+        string nm = LVN.get(lv)
+        if keyB >= 0
+            bool brokeKey = tr > 0 ? close < keyP : close > keyP
+            if brokeKey and keyB != warnKeyBar.get(lv)
+                warnKeyBar.set(lv, keyB)         // consumed even during warm-up
+                if not warm
+                    outKey.set(lv, float(sgn))
+                    f_notify(alertKey.get(lv), f_hdr() + nm + " KEY " + what + " broken (warning) on closed bar " + f_ts())
+        if critB >= 0
+            bool brokeCrit = tr > 0 ? close < critP : close > critP
+            if brokeCrit and critB != brokeCritBar.get(lv)
+                brokeCritBar.set(lv, critB)      // consumed even during warm-up
+                if not warm
+                    outCrit.set(lv, float(sgn))
+                    critBroken := true
+                    m.trend := 0
+                    m.counter := 0
+                    f_notify(alertCrit.get(lv), f_hdr() + nm + " CRITICAL " + what + " broken: trend change on closed bar " + f_ts())
+    outTrend.set(lv, float(m.trend))
+    outKeyP.set(lv, keyP)
+    outCritP.set(lv, critP)
+    if critBroken
+        gKeyP.set(lv, na)
+        gKeyB.set(lv, -1)
+        gCritP.set(lv, na)
+        gCritB.set(lv, -1)
+
+// =============================================================================
+// DRAWING (last bar only)
+// =============================================================================
+f_zigzag(int lv, LevelList l) =>
+    if showZZ.get(lv)
+        array<chart.point> pts = array.new<chart.point>()
+        int minBar = lastProc - inpDrawBack
+        int i = f_size(l) - 1
+        while i >= 0
+            SwingPt p = f_at(l, i)
+            if p.bar < minBar
+                break
+            pts.unshift(chart.point.from_index(p.bar, p.price))
+            i := i - 1
+        if pts.size() >= 2
+            polys.push(polyline.new(pts, line_color = lvColor.get(lv), line_width = lvWidth.get(lv)))
+
+f_hline(float price, int swingBar, color col, string sty) =>
+    int x1 = math.max(swingBar, lastProc - inpDrawBack)
+    int x2 = math.max(lastProc, x1 + 1)
+    lns.push(line.new(x1, price, x2, price, xloc = xloc.bar_index, extend = extend.right,
+         color = col, style = sty, width = 1))
+
+f_levels(int lv) =>
+    if showLv.get(lv)
+        if gKeyB.get(lv) >= 0 and not na(gKeyP.get(lv))
+            f_hline(gKeyP.get(lv), gKeyB.get(lv), lvColor.get(lv), line.style_dashed)
+        if gCritB.get(lv) >= 0 and not na(gCritP.get(lv))
+            f_hline(gCritP.get(lv), gCritB.get(lv), lvColor.get(lv), line.style_solid)
+
+f_drawAll() =>
+    for pl in polys
+        polyline.delete(pl)
+    polys.clear()
+    for ln in lns
+        line.delete(ln)
+    lns.clear()
+    // ST first, LT last so the long-term swings sit on top
+    f_zigzag(0, stL)
+    f_zigzag(1, itL)
+    f_zigzag(2, ltL)
+    f_levels(0)
+    f_levels(1)
+    f_levels(2)
+
+// =============================================================================
+// MAIN: runs on closed bars only
+// =============================================================================
+if barstate.isconfirmed
+    f_structure()
+    f_nextLevel(itL, stL)
+    f_nextLevel(ltL, itL)
+    if bar_index >= startBar and bar_index >= 5
+        bool warm = bar_index == startBar
+        f_process(0, stL, warm)
+        f_process(1, itL, warm)
+        f_process(2, ltL, warm)
+        if not warm
+            f_evalPending()
+        f_evalLevel(0, stL, warm)
+        f_evalLevel(1, itL, warm)
+        f_evalLevel(2, ltL, warm)
+        outS.set(0, es.sigNow == 0 ? na : float(es.sigNow))
+        outS.set(1, es.tradeState == 0 ? na : float(es.tradeState))
+        outS.set(2, float(eng.trend))
+        lastProc := bar_index
+
+if barstate.islast and lastProc >= 0
+    f_drawAll()
+    if inpDebug
+        log.info("WSW ST={0} IT={1} LT={2} state={3} pending={4}",
+             f_size(stL), f_size(itL), f_size(ltL), es.tradeState, es.pendDir)
+
+// =============================================================================
+// PLOTS
+// =============================================================================
+plotshape(es.sigNow == 1, "BOS Buy", shape.triangleup, location.belowbar, color.lime, size = size.small)
+plotshape(es.sigNow == -1, "BOS Sell", shape.triangledown, location.abovebar, color.red, size = size.small)
+
+// Critical breaks (only for levels whose lines are enabled). +1 resistance broken, -1 support broken.
+plotshape(inpShowLv_ST and outCrit.get(0) == 1, "ST crit up", shape.diamond, location.belowbar, inpColST, size = size.tiny)
+plotshape(inpShowLv_ST and outCrit.get(0) == -1, "ST crit down", shape.diamond, location.abovebar, inpColST, size = size.tiny)
+plotshape(inpShowLv_IT and outCrit.get(1) == 1, "IT crit up", shape.diamond, location.belowbar, inpColIT, size = size.tiny)
+plotshape(inpShowLv_IT and outCrit.get(1) == -1, "IT crit down", shape.diamond, location.abovebar, inpColIT, size = size.tiny)
+plotshape(inpShowLv_LT and outCrit.get(2) == 1, "LT crit up", shape.diamond, location.belowbar, inpColLT, size = size.tiny)
+plotshape(inpShowLv_LT and outCrit.get(2) == -1, "LT crit down", shape.diamond, location.abovebar, inpColLT, size = size.tiny)
+
+// Data-window-only "buffers" (also readable by other scripts via input.source)
+plot(outS.get(0), "Signal (+1 buy / -1 sell)", display = display.data_window)
+plot(outS.get(1), "Trade state", display = display.data_window)
+plot(outS.get(2), "IT engine trend", display = display.data_window)
+plot(outTrend.get(0), "ST trend", display = display.data_window)
+plot(outCrit.get(0), "ST critical break", display = display.data_window)
+plot(outKey.get(0), "ST key warning", display = display.data_window)
+plot(outKeyP.get(0), "ST key price", display = display.data_window)
+plot(outCritP.get(0), "ST critical price", display = display.data_window)
+plot(outTrend.get(1), "IT trend", display = display.data_window)
+plot(outCrit.get(1), "IT critical break", display = display.data_window)
+plot(outKey.get(1), "IT key warning", display = display.data_window)
+plot(outKeyP.get(1), "IT key price", display = display.data_window)
+plot(outCritP.get(1), "IT critical price", display = display.data_window)
+plot(outTrend.get(2), "LT trend", display = display.data_window)
+plot(outCrit.get(2), "LT critical break", display = display.data_window)
+plot(outKey.get(2), "LT key warning", display = display.data_window)
+plot(outKeyP.get(2), "LT key price", display = display.data_window)
+plot(outCritP.get(2), "LT critical price", display = display.data_window)
